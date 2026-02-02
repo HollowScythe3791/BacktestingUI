@@ -1,42 +1,17 @@
 """
 data_handler.py
 Multi-timeframe data preparation module for the VectorBT validation engine.
-Optimized for memory efficiency using chunked loading.
+Refactored to use DuckDB for high-performance CSV loading and filtering.
 """
 
+import duckdb
 import pandas as pd
 import numpy as np
 import gc
 import os
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 from datetime import datetime, timedelta
-
-def get_last_timestamp(filepath: str) -> int:
-    """
-    Efficiently read the last line of a file to get the last timestamp
-    without loading the whole file.
-    """
-    with open(filepath, 'rb') as f:
-        try:
-            f.seek(-1024, os.SEEK_END)
-        except OSError:
-            # File is smaller than 1024 bytes, read from beginning
-            f.seek(0)
-            
-        last_lines = f.readlines()
-        if not last_lines:
-            return 0
-            
-        # Get the very last line
-        last_line = last_lines[-1].decode('utf-8')
-        
-        # Parse the first column (Timestamp)
-        try:
-            timestamp = int(float(last_line.split(',')[0]))
-            return timestamp
-        except (IndexError, ValueError):
-            return 0
 
 def load_kraken_data_windowed(filepath: str, lookback_years: int) -> pd.DataFrame:
     """
@@ -50,69 +25,66 @@ def load_kraken_data_windowed(filepath: str, lookback_years: int) -> pd.DataFram
     Returns:
         DataFrame with datetime index and OHLCV columns
     """
-    # 1. Get the last timestamp in the file to calculate the cutoff
-    last_ts = get_last_timestamp(filepath)
-    if last_ts == 0:
-        raise ValueError(f"Could not determine valid timestamp from {filepath}")
+    # Initialize DuckDB connection
+    con = duckdb.connect(database=':memory:')
 
-    # Calculate cutoff (Current End - Years)
-    # Kraken timestamps are in seconds
-    seconds_per_year = 31536000    # 360 * 24 * 60 * 60
+    # 1. Get the last timestamp efficiently
+    # Kraken CSVs are headerless: Timestamp, Open, High, Low, Close, Volume, Trades
+    # we treat them as column0..column6
+    try:
+        # We use a limit query or aggregate max to find the end
+        query_max = f"SELECT max(column0) FROM read_csv('{filepath}', header=False, auto_detect=True)"
+        last_ts = con.execute(query_max).fetchone()[0]
+
+        if last_ts is None:
+            raise ValueError(f"Could not determine valid timetamp from {filepath}")
+
+    except Exception as e:
+        raise ValueError(f"Error reading file metadata: {e}")
+
+    # Calculate cutoff
+    seconds_per_year = 31536000
     cutoff_ts = last_ts - (lookback_years * seconds_per_year)
-    
-    print(f"Filtering data: Loading from {datetime.utcfromtimestamp(cutoff_ts)} to {datetime.utcfromtimestamp(last_ts)}")
 
-    # 2. Read in chunks
-    chunk_size = 100000 # Process 100k rows at a time
-    chunks = []
-    
-    # Define column names
-    col_names = ['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume', 'Trades']
-    
-    # Create iterator
-    reader = pd.read_csv(
-        filepath, 
-        header=None, 
-        names=col_names, 
-        chunksize=chunk_size,
-        dtype={'Timestamp': float, 'Open': float, 'High': float, 'Low': float, 'Close': float, 'Volume': float}
-    )
+    dt_start = datetime.utcfromtimestamp(cutoff_ts)
+    dt_end = datetime.utcfromtimestamp(last_ts)
+    print(f"Filtering data: Loading from {dt_start} to {dt_end}")
 
-    for chunk in reader:
-        # Check if the chunk contains data we need
-        # If the last row of the chunk is older than cutoff, skip the whole chunk
-        if chunk.iloc[-1]['Timestamp'] < cutoff_ts:
-            continue
-        
-        # If the chunk overlaps with our window
-        if chunk.iloc[0]['Timestamp'] < cutoff_ts:
-            # Filter rows inside this specific chunk
-            chunk = chunk[chunk['Timestamp'] >= cutoff_ts]
-        
-        # Drop 'Trades' column immediately to save RAM
-        chunk.drop('Trades', axis=1, inplace=True)
-        chunks.append(chunk)
+    # 2. Load and Filter Data using SQL
+    # We perform projection (selecting columns), filtering (WHERE), 
+    # and type conversion (to_timestamp) inside the DB engine.
+    query_load = f"""
+        SELECT 
+            -- Convert Unix Epoch (seconds) to Timestamp directly
+            to_timestamp(column0) as Timestamp,
+            column1::DOUBLE as Open,
+            column2::DOUBLE as High,
+            column3::DOUBLE as Low,
+            column4::DOUBLE as Close,
+            column5::DOUBLE as Volume
+        FROM read_csv('{filepath}', header=False, auto_detect=True)
+        WHERE column0 >= {cutoff_ts}
+        ORDER BY column0 ASC
+    """
 
-    if not chunks:
+    # Execute and fetch as Pandas DataFrame
+    # DuckDB uses Apache Arrow under the hood for zero-copy data transfer where possible
+    df = con.execute(query_load).df()
+    
+    # Clean up DB connection
+    con.close()
+
+    if df.empty:
         raise ValueError("No data found within the specified lookback period.")
 
-    # 3. Concatenate valid chunks
-    df = pd.concat(chunks, ignore_index=True)
-    
-    # Clean up chunks list to free memory
-    del chunks
-    gc.collect()
-
-    # 4. Final Formatting
-    # Convert epoch timestamp to datetime index (UTC)
-    df['Timestamp'] = pd.to_datetime(df['Timestamp'], unit='s', utc=True)
+    # 3. Final Formatting
     df.set_index('Timestamp', inplace=True)
     
-    # Sort index to ensure chronological order
-    df.sort_index(inplace=True)
+    # Ensure UTC timezone awareness (DuckDB returns naive timestamps by default usually)
+    if df.index.tz is None:
+        df.index = df.index.tz_localize('UTC')
     
     return df
-
 
 def resample_ohlcv(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
     """
@@ -212,17 +184,21 @@ def get_data_summary(data_dict: Dict[str, pd.DataFrame]) -> dict:
 
 if __name__ == "__main__":
     import sys
+    import time
     
     symbol = sys.argv[1] if len(sys.argv) > 1 else "XBTUSD"
     timeframes = ['5m', '1h', '4h', '1d']
     
     try:
+        t0 = time.time()
         # Test with a specific lookback of 1 year to verify filtering
         data_dict = prepare_data(symbol, data_dir=".", timeframes=timeframes, lookback_years=7)
+        t1 = time.time()
         
         print("\n" + "="*50)
         print("DATA SUMMARY")
         print("="*50)
+        print(f"Execution Time: {t1 - t0:.4f} seconds")
         
         summary = get_data_summary(data_dict)
         for tf, info in summary.items():
