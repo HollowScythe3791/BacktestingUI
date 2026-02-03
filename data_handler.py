@@ -1,168 +1,213 @@
-"""
-data_handler.py
-Multi-timeframe data preparation module for the VectorBT validation engine.
-Refactored to use DuckDB for high-performance CSV loading and filtering.
-"""
-
 import duckdb
+import pyarrow as pa
 import pandas as pd
-import numpy as np
-import gc
-import os
-from pathlib import Path
-from typing import Dict, Optional, List
+import re
+import time
 from datetime import datetime, timedelta
+from typing import List, Dict, Optional
 
-def load_kraken_data_windowed(filepath: str, lookback_years: int) -> pd.DataFrame:
+# ==========================================
+# 1. Setup & Existing Loading Logic
+# ==========================================
+
+db_path = 'financial_data.duckdb'
+con = duckdb.connect(db_path)
+
+con.execute("""
+    CREATE TABLE IF NOT EXISTS market_data (
+        unixtime BIGINT,
+        symbol VARCHAR,
+        timeframe VARCHAR,
+        open DOUBLE,
+        high DOUBLE,
+        low DOUBLE,
+        close DOUBLE,
+        volume DOUBLE,
+        num_trades BIGINT,
+        PRIMARY KEY (symbol, timeframe, unixtime)
+    );
+""")
+
+def load_csv_to_duckdb(csv_path, symbol, timeframe, conn):
     """
-    Load Kraken OHLCV data from CSV file using chunking to save memory.
-    Only loads data within the lookback window.
-    
+    Directly ingests raw CSV data into DuckDB. 
+
     Args:
-        filepath: Path to the Kraken CSV file
-        lookback_years: Number of years of data to load from the end of file
-        
-    Returns:
-        DataFrame with datetime index and OHLCV columns
+        csv_path: path of csv data to ingest
+        symbol: symbol to store in database
+        timeframe: timeframe to store in db
+
     """
-    # Initialize DuckDB connection
-    con = duckdb.connect(database=':memory:')
-
-    # 1. Get the last timestamp efficiently
-    # Kraken CSVs are headerless: Timestamp, Open, High, Low, Close, Volume, Trades
-    # we treat them as column0..column6
-    try:
-        # We use a limit query or aggregate max to find the end
-        query_max = f"SELECT max(column0) FROM read_csv('{filepath}', header=False, auto_detect=True)"
-        last_ts = con.execute(query_max).fetchone()[0]
-
-        if last_ts is None:
-            raise ValueError(f"Could not determine valid timetamp from {filepath}")
-
-    except Exception as e:
-        raise ValueError(f"Error reading file metadata: {e}")
-
-    # Calculate cutoff
-    seconds_per_year = 31536000
-    cutoff_ts = last_ts - (lookback_years * seconds_per_year)
-
-    dt_start = datetime.utcfromtimestamp(cutoff_ts)
-    dt_end = datetime.utcfromtimestamp(last_ts)
-    print(f"Filtering data: Loading from {dt_start} to {dt_end}")
-
-    # 2. Load and Filter Data using SQL
-    # We perform projection (selecting columns), filtering (WHERE), 
-    # and type conversion (to_timestamp) inside the DB engine.
-    query_load = f"""
+    print(f"Loading {symbol} ({timeframe}) into DuckDB ingest...")
+    
+    # define the columns expected in the CSV file 
+    csv_schema = {
+        'unixtime': 'BIGINT',
+        'open': 'DOUBLE',
+        'high': 'DOUBLE',
+        'low': 'DOUBLE',
+        'close': 'DOUBLE',
+        'volume': 'DOUBLE',
+        'num_trades': 'BIGINT'
+    }
+    columns_str = ", ".join([f"'{k}': '{v}'" for k, v in csv_schema.items()])
+    
+    # The Query:
+    # 1. We specify the target columns in the INSERT statement to be safe.
+    # 2. We Select from read_csv, injecting the 'symbol' and 'timeframe' literals on the fly.
+    query = f"""
+        INSERT OR IGNORE INTO market_data (
+            unixtime, symbol, timeframe, open, high, low, close, volume, num_trades
+        )
         SELECT 
-            -- Convert Unix Epoch (seconds) to Timestamp directly
-            to_timestamp(column0) as Timestamp,
-            column1::DOUBLE as Open,
-            column2::DOUBLE as High,
-            column3::DOUBLE as Low,
-            column4::DOUBLE as Close,
-            column5::DOUBLE as Volume
-        FROM read_csv('{filepath}', header=False, auto_detect=True)
-        WHERE column0 >= {cutoff_ts}
-        ORDER BY column0 ASC
+            unixtime, 
+            '{symbol}' AS symbol, 
+            '{timeframe}' AS timeframe, 
+            open, 
+            high, 
+            low, 
+            close, 
+            volume, 
+            num_trades
+        FROM read_csv('{csv_path}', 
+            header=False, 
+            columns={{{columns_str}}}
+        )
     """
-
-    # Execute and fetch as Pandas DataFrame
-    # DuckDB uses Apache Arrow under the hood for zero-copy data transfer where possible
-    df = con.execute(query_load).df()
     
-    # Clean up DB connection
-    con.close()
+    # Execute
+    conn.execute(query)
+    
+    # Optional: Get count of what was actually inserted (vs ignored)
+    # Note: changes() returns total rows affected by the last query
+    affected = conn.fetchall() # This might return empty depending on version, usually execute is enough
+    
+    print(f"Ingestion complete for {symbol}.")
 
+def _parse_timeframe_to_seconds(tf: str) -> int:
+    """
+    Helper to convert '5m', '1h', '1d' into seconds for SQL math.
+    """
+    match = re.match(r"(\d+)([mhd])", tf)
+    if not match:
+        raise ValueError(f"Invalid timeframe format: {tf}")
+    
+    val, unit = int(match.group(1)), match.group(2)
+    
+    if unit == 'm': return val * 60
+    if unit == 'h': return val * 3600
+    if unit == 'd': return val * 86400
+    return 60 # Default to 1m
+
+def resample_ohlcv(symbol: str, timeframe: str, conn: duckdb.DuckDBPyConnection):
+    """
+    Resamples 1-minute data in the database to higher timeframes.
+    Uses FLOOR() to guarantee deterministic bucketing.
+    """
+    # Check if data exists
+    exists_query = "SELECT COUNT(*) FROM market_data WHERE symbol = ? AND timeframe = ?"
+    count = conn.execute(exists_query, [symbol, timeframe]).fetchone()[0]
+    
+    if count > 0:
+        return
+
+    print(f"Resampling {symbol} 1m -> {timeframe}...")
+    
+    seconds_bucket = _parse_timeframe_to_seconds(timeframe)
+    
+    # Perform Aggregation
+    # We cast to DOUBLE to allow division, FLOOR it to kill the remainder, 
+    # then multiply back to get the bucket start.
+    query = f"""
+        INSERT OR IGNORE INTO market_data
+        SELECT
+            CAST(FLOOR(unixtime::DOUBLE / {seconds_bucket}) * {seconds_bucket} AS BIGINT) as unixtime,
+            symbol,
+            '{timeframe}' as timeframe,
+            arg_min(open, unixtime) as open,
+            max(high) as high,
+            min(low) as low,
+            arg_max(close, unixtime) as close,
+            sum(volume) as volume,
+            sum(num_trades) as num_trades
+        FROM market_data
+        WHERE symbol = ? AND timeframe = '1m'
+        GROUP BY 1, 2
+    """
+    
+    conn.execute(query, [symbol])
+    print(f"Resampling complete for {symbol} {timeframe}.")
+
+def load_data(symbol: str, timeframe: str, lookback_years: int, conn: duckdb.DuckDBPyConnection) -> pd.DataFrame:
+    """
+    Load OHLCV data from DuckDB relative to the LAST available data point.
+    Anchors the lookback window to the end of the dataset, not the current wall time.
+    """
+    # 1. Ensure the timeframe exists (lazy generation)
+    resample_ohlcv(symbol, timeframe, conn)
+    
+    # 2. Find the most recent timestamp in the DB for this symbol/timeframe
+    # We query this first to establish our anchor point.
+    max_ts_query = "SELECT MAX(unixtime) FROM market_data WHERE symbol = ? AND timeframe = ?"
+    max_ts = conn.execute(max_ts_query, [symbol, timeframe]).fetchone()[0]
+
+    # Handle case where no data exists even after attempted resampling
+    if max_ts is None:
+        return pd.DataFrame()
+
+    # 3. Calculate Start Timestamp (Epoch Seconds)
+    # 365 days * 24 hours * 60 minutes * 60 seconds = 31,536,000 seconds/year
+    seconds_per_year = 31_536_000
+    cutoff_ts = max_ts - (lookback_years * seconds_per_year)
+    
+    # 4. Query Data within the Window
+    query = """
+        SELECT unixtime, open, high, low, close, volume, num_trades
+        FROM market_data
+        WHERE symbol = ? 
+          AND timeframe = ? 
+          AND unixtime >= ?
+        ORDER BY unixtime ASC
+    """
+    
+    # 5. Fetch as Arrow
+    arrow_result = conn.execute(query, [symbol, timeframe, cutoff_ts]).arrow()
+    
+    # Handle RecordBatchReader vs Table (DuckDB version compatibility)
+    if isinstance(arrow_result, pa.lib.RecordBatchReader):
+        arrow_table = arrow_result.read_all()
+    else:
+        arrow_table = arrow_result
+
+    df = arrow_table.to_pandas()
+    
     if df.empty:
-        raise ValueError("No data found within the specified lookback period.")
+        return df
 
-    # 3. Final Formatting
-    df.set_index('Timestamp', inplace=True)
-    
-    # Ensure UTC timezone awareness (DuckDB returns naive timestamps by default usually)
-    if df.index.tz is None:
-        df.index = df.index.tz_localize('UTC')
+    # 6. Formatting for Quant usage (Datetime Index)
+    df['datetime'] = pd.to_datetime(df['unixtime'], unit='s')
+    df.set_index('datetime', inplace=True)
+    df.drop(columns=['unixtime'], inplace=True)
     
     return df
 
-def resample_ohlcv(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
+def prepare_data(symbol: str, conn: duckdb.DuckDBPyConnection, timeframes: Optional[List[str]] = None, lookback_years: int = 2) -> Dict[str, pd.DataFrame]:
     """
-    Resample 1-minute OHLCV data to a higher timeframe.
-    """
-    # Convert common timeframe notation to pandas 2.x compatible format
-    tf_conversion = {
-        '1m': '1min', '5m': '5min', '15m': '15min', '30m': '30min',
-        '1h': '1h', '2h': '2h', '4h': '4h', '6h': '6h', '8h': '8h', '12h': '12h',
-        '1d': '1D', '1D': '1D', '1w': '1W', '1W': '1W',
-    }
-    
-    pandas_tf = tf_conversion.get(timeframe, timeframe)
-    
-    ohlc_agg = {
-        'Open': 'first',
-        'High': 'max',
-        'Low': 'min',
-        'Close': 'last',
-        'Volume': 'sum'
-    }
-    
-    resampled = df.resample(pandas_tf).agg(ohlc_agg)
-    resampled.dropna(inplace=True)
-    
-    return resampled
-
-def prepare_data(
-    symbol: str,
-    data_dir: str = "data/kraken",
-    timeframes: Optional[list] = None,
-    lookback_years: int = 2,
-) -> Dict[str, pd.DataFrame]:
-    """
-    Prepare multi-timeframe data from a single 1-minute source file.
-    Only loads the requested lookback window into memory.
+    Orchestrator to get a dictionary of dataframes for multiple timeframes.
     """
     if timeframes is None:
-        timeframes = ['15m', '30m', '1h', '4h', '1d']
+        timeframes = ['1m']
+        
+    data_store = {}
     
-    # Construct filepath
-    filepath = Path(data_dir) / f"{symbol}_1.csv"
-    
-    # Check if file exists (with fallback options)
-    if not filepath.exists():
-        alt_paths = [
-            Path(data_dir) / f"{symbol}-1m.csv",
-            Path(data_dir) / f"{symbol}.csv",
-            Path(data_dir) / f"{symbol}_1m.csv",
-        ]
-        for alt_path in alt_paths:
-            if alt_path.exists():
-                filepath = alt_path
-                break
-        else:
-            raise FileNotFoundError(
-                f"Could not find data file for {symbol} in {data_dir}."
-            )
-    
-    # Load windowed 1-minute data directly
-    print(f"Loading 1-minute data from {filepath} (Last {lookback_years} years)...")
-    
-    # Uses the new memory-efficient loader
-    df_1m = load_kraken_data_windowed(str(filepath), lookback_years)
-    
-    print(f"Loaded {len(df_1m):,} bars from {df_1m.index[0]} to {df_1m.index[-1]}")
-    print(f"Total time duration: {(df_1m.index[-1] - df_1m.index[0]).days} days")
-
-    # Initialize result dictionary with 1-minute data
-    data_dict = {'1m': df_1m}
-    
-    # Resample to each target timeframe
     for tf in timeframes:
-        print(f"Resampling to {tf}...")
-        data_dict[tf] = resample_ohlcv(df_1m, tf)
-        print(f"  -> {len(data_dict[tf]):,} bars")
-    
-    return data_dict
+        df = load_data(symbol, tf, lookback_years, conn)
+        if not df.empty:
+            data_store[tf] = df
+        else:
+            print(f"Warning: No data found for {symbol} {tf} within lookback window.")
+            
+    return data_store
 
 def get_data_summary(data_dict: Dict[str, pd.DataFrame]) -> dict:
     """
@@ -170,42 +215,44 @@ def get_data_summary(data_dict: Dict[str, pd.DataFrame]) -> dict:
     """
     summary = {}
     for tf, df in data_dict.items():
+        if df.empty:
+            summary[tf] = "Empty DataFrame"
+            continue
+            
         summary[tf] = {
             'bars': len(df),
             'start': df.index[0].isoformat(),
             'end': df.index[-1].isoformat(),
             'duration_days': (df.index[-1] - df.index[0]).days,
+            'last_close': df['close'].iloc[-1]
         }
     return summary
 
-# =============================================================================
-# CLI Testing
-# =============================================================================
+# ==========================================
+# 3. Execution / Testing
+# ==========================================
 
-if __name__ == "__main__":
-    import sys
-    import time
-    
-    symbol = sys.argv[1] if len(sys.argv) > 1 else "XBTUSD"
-    timeframes = ['5m', '1h', '4h', '1d']
-    
-    try:
-        t0 = time.time()
-        # Test with a specific lookback of 1 year to verify filtering
-        data_dict = prepare_data(symbol, data_dir=".", timeframes=timeframes, lookback_years=7)
-        t1 = time.time()
-        
-        print("\n" + "="*50)
-        print("DATA SUMMARY")
-        print("="*50)
-        print(f"Execution Time: {t1 - t0:.4f} seconds")
-        
-        summary = get_data_summary(data_dict)
-        for tf, info in summary.items():
-            print(f"\n{tf}:")
-            print(f"  Bars: {info['bars']:,}")
-            print(f"  Period: {info['start'][:10]} to {info['end'][:10]}")
-            print(f"  Duration: {info['duration_days']} days")
-            
-    except Exception as e:
-        print(f"Error: {e}")
+# 1. Load Dummy Data (Using your 'XBTUSD_1.csv' example logic)
+# Ensure you have a CSV file named 'XBTUSD_1.csv' available, or this line will fail.
+load_csv_to_duckdb('XBTUSD_1.csv', 'BTC-USD', '1m', con)
+
+# 2. Request Data (Logic Test)
+# This will trigger the resample logic to create 5-minute bars from the 1-minute data
+requested_tfs = ['1m', '5m', '1h']
+data_bundle = prepare_data('BTC-USD', conn=con, timeframes=requested_tfs, lookback_years=7)
+
+# 3. View Summary
+summary = get_data_summary(data_bundle)
+print("\nData Summary:")
+print(summary)
+
+for tf, df in data_bundle.items():
+    print(f"Data for {tf}")
+    print(df)
+
+# 4. Inspect Dataframe
+if '5m' in data_bundle:
+    print("\nSample 5m Data (Resampled):")
+    print(data_bundle['5m'].head())
+
+con.close()
