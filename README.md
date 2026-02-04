@@ -9,4 +9,4 @@ This tool will load 1 minute .csv timeseries data and analyze it for the followi
 
 Once loaded into DuckDB, and the higher timeframes databases are created, the 
 tool should attach all results of the timeframe to the associated database. 
-The test should get the past 10 years max. 
+
