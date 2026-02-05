@@ -5,28 +5,9 @@ import re
 import time
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
-
 # ==========================================
 # 1. Setup & Existing Loading Logic
 # ==========================================
-
-db_path = 'financial_data.duckdb'
-con = duckdb.connect(db_path)
-
-con.execute("""
-    CREATE TABLE IF NOT EXISTS market_data (
-        unixtime BIGINT,
-        symbol VARCHAR,
-        timeframe VARCHAR,
-        open DOUBLE,
-        high DOUBLE,
-        low DOUBLE,
-        close DOUBLE,
-        volume DOUBLE,
-        num_trades BIGINT,
-        PRIMARY KEY (symbol, timeframe, unixtime)
-    );
-""")
 
 def load_csv_to_duckdb(csv_path, symbol, timeframe, conn):
     """
@@ -196,98 +177,17 @@ def get_data_summary(data_dict: Dict[str, pd.DataFrame]) -> dict:
         }
     return summary
 
-def run_chan_integrity_gate(symbol, timeframe, lookback_years=2, db_path='financial_data.duckdb'):
-    """
-    Runs integrity check on past lookback_years of data. 
-    Includes: Window Density, Amihud Ratio, and Time-Step Integrity.
-    """
-
-    con = duckdb.connect(db_path)
-    print(f"--- 🛡️ Gate 0: Integrity Report for {symbol} ({timeframe}) | Lookback: {lookback_years}y ---")
-    
-    # 1. Determine the Time Window
-    max_ts = con.execute("SELECT MAX(unixtime) FROM market_data WHERE symbol = ? AND timeframe = ?", [symbol, timeframe]).fetchone()[0]
-    if max_ts is None:
-        print("❌ ERROR: Database is empty.")
-        return False
-    
-    cutoff_ts = max_ts - (lookback_years * 31_536_000)
-    step = _parse_timeframe_to_seconds(timeframe)
-
-    # 2. Density Check within Window
-    density_query = """
-    SELECT 
-        COUNT(*) as actual,
-        ((MAX(unixtime) - MIN(unixtime)) / ?) + 1 as expected
-    FROM market_data 
-    WHERE symbol = ? AND timeframe = ? AND unixtime >= ?
-    """
-    actual, expected = con.execute(density_query, [step, symbol, timeframe, cutoff_ts]).fetchone()
-    density = round((actual / expected) * 100, 2) if expected else 0
-
-    # 3. Amihud Ratio within Window
-    amihud_query = """
-    WITH rets AS (
-        SELECT ABS(ln(close / LAG(close) OVER (ORDER BY unixtime))) / NULLIF(volume * close, 0) as impact
-        FROM market_data 
-        WHERE symbol = ? AND timeframe = ? AND unixtime >= ?
-    )
-    SELECT COALESCE(AVG(impact), 0) FROM rets WHERE impact IS NOT NULL
-    """
-    amihud_val = con.execute(amihud_query, [symbol, timeframe, cutoff_ts]).fetchone()[0]
-
-    # 4. Time-Step Integrity Check
-    # This checks if the difference between consecutive rows equals the expected step.
-    step_integrity_query = """
-    WITH steps AS (
-        SELECT 
-            unixtime,
-            LEAD(unixtime) OVER (ORDER BY unixtime) - unixtime as step_diff
-        FROM market_data
-        WHERE symbol = ? AND timeframe = ? AND unixtime >= ?
-    )
-    SELECT 
-        COUNT(*) as violations,
-        MAX(step_diff) as max_gap_seconds
-    FROM steps
-    WHERE step_diff IS NOT NULL AND step_diff != ?
-    """
-    violations, max_gap = con.execute(step_integrity_query, [symbol, timeframe, cutoff_ts, step]).fetchone()
-    violations = violations if violations else 0
-    max_gap = max_gap if max_gap else 0
-
-    # --- VERDICT ---
-    # We pass if density is high AND there are no step violations
-    # (Note: For crypto 24/7 markets, violations should be 0. For stocks, weekends will cause violations).
-    is_continuous = (violations == 0)
-    status = "✅ PASS" if density > 99.0 and is_continuous else "❌ FAIL"
-    
-    print(f"📊 Window Density: {density}%")
-    print(f"⏱️ Time-Step Violations: {violations} (Max Gap: {max_gap}s)")
-    print(f"💧 Window Amihud: {amihud_val:.12f}")
-    print(f"⚖️ Final Verdict: {status}")
-    
-    if not is_continuous:
-        print(f"   -> Found {violations} gaps where time difference != {step}s.")
-    
-    if density <= 99.0:
-        print("💡 Suggestion: Run repair_data_and_fill_gaps() to fix the missing bars.")
-    
-    con.close()
-    return status == "✅ PASS"
 
 # ==========================================
 # Execution Example
 # ==========================================
 
-            
-
-def repair_data_gaps(symbol: str, timeframe: str, db_path='financial_data.duckdb'):
+def repair_data_gaps(symbol: str, timeframe: str, conn: duckdb.DuckDBPyConnection):
     """
     Identifies gaps in the time series and fills them with 
     flat candles (previous close) and 0 volume.
     """
-    con = duckdb.connect(db_path)
+    
     print(f"🔧 Starting Repair Process for {symbol} {timeframe}...")
 
     step = _parse_timeframe_to_seconds(timeframe)
@@ -339,44 +239,6 @@ def repair_data_gaps(symbol: str, timeframe: str, db_path='financial_data.duckdb
     WHERE unixtime IS NULL
     """
     
-    con.execute(repair_query)
+    conn.execute(repair_query)
     print(f"✅ Repair complete. Gaps filled with 0-volume flat bars.")
     
-    con.close()
-
-# ==========================================
-# HOW TO RUN THE FIX
-# ==========================================
-
-
-# 1. Load Dummy Data (Using your 'XBTUSD_1.csv' example logic)
-# Ensure you have a CSV file named 'XBTUSD_1.csv' available.
-try:
-    load_csv_to_duckdb('XBTUSD_1.csv', 'BTC-USD', '1m', con)
-except Exception as e:
-    print(f"Skipping CSV load (File not found or error): {e}")
-
-# 2. Request Data (Logic Test)
-requested_tfs = ['1m', '5m', '1h']
-data_bundle = prepare_data('BTC-USD', conn=con, timeframes=requested_tfs, lookback_years=7)
-
-# 3. View Summary
-summary = get_data_summary(data_bundle)
-print("\nData Summary:")
-print(summary)
-
-# 4. Run the Gate
-db_file = 'financial_data.duckdb'
-target_symbol = 'BTC-USD'
-target_tf = '1h'
-
-is_passed = run_chan_integrity_gate(target_symbol, target_tf, lookback_years=2)
-
-# 1. Run the repair function
-repair_data_gaps('BTC-USD', '1h')
-
-# 2. Run the Integrity Gate again to verify PASS
-print("\n--- Re-Verifying Integrity ---")
-run_chan_integrity_gate('BTC-USD', '1h', lookback_years=2)
-con.close()
-
