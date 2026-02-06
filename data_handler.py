@@ -9,7 +9,7 @@ from typing import List, Dict, Optional
 # 1. Setup & Existing Loading Logic
 # ==========================================
 
-def load_csv_to_duckdb(csv_path, symbol, timeframe, conn):
+def load_csv_to_duckdb(csv_path: str, symbol: str, timeframe: str, conn: duckdb.DuckDBPyConnection):
     """
     Directly ingests raw CSV data into DuckDB. 
     """
@@ -98,7 +98,7 @@ def resample_ohlcv(symbol: str, timeframe: str, conn: duckdb.DuckDBPyConnection)
     conn.execute(query, [symbol])
     print(f"Resampling complete for {symbol} {timeframe}.")
 
-def load_data(symbol: str, timeframe: str, lookback_years: int, conn: duckdb.DuckDBPyConnection) -> pd.DataFrame:
+def load_data(symbol: str, timeframe: str, lookback_years: float, conn: duckdb.DuckDBPyConnection) -> pd.DataFrame:
     """
     Load OHLCV data from DuckDB relative to the LAST available data point.
     """
@@ -111,7 +111,7 @@ def load_data(symbol: str, timeframe: str, lookback_years: int, conn: duckdb.Duc
         return pd.DataFrame()
 
     seconds_per_year = 31_536_000
-    cutoff_ts = max_ts - (lookback_years * seconds_per_year)
+    cutoff_ts = int(max_ts - (lookback_years * seconds_per_year))
     
     query = """
         SELECT unixtime, open, high, low, close, volume, num_trades
@@ -140,7 +140,7 @@ def load_data(symbol: str, timeframe: str, lookback_years: int, conn: duckdb.Duc
     
     return df
 
-def prepare_data(symbol: str, conn: duckdb.DuckDBPyConnection, timeframes: Optional[List[str]] = None, lookback_years: int = 2) -> Dict[str, pd.DataFrame]:
+def prepare_data(symbol: str, conn: duckdb.DuckDBPyConnection, timeframes: Optional[List[str]] = None, lookback_years: float = 2) -> Dict[str, pd.DataFrame]:
     """
     Orchestrator to get a dictionary of dataframes for multiple timeframes.
     """
@@ -176,11 +176,6 @@ def get_data_summary(data_dict: Dict[str, pd.DataFrame]) -> dict:
             'last_close': df['close'].iloc[-1]
         }
     return summary
-
-
-# ==========================================
-# Execution Example
-# ==========================================
 
 def repair_data_gaps(symbol: str, timeframe: str, conn: duckdb.DuckDBPyConnection):
     """

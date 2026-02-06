@@ -1,6 +1,6 @@
 import duckdb
 from data_handler import load_csv_to_duckdb, prepare_data, get_data_summary, repair_data_gaps
-from gate0 import run_chan_integrity_gate
+from gate0 import run_chan_integrity_gate, perform_adf_test, calculate_hurst_exponent
 
 db_path = 'financial_data.duckdb'
 con = duckdb.connect(db_path)
@@ -34,6 +34,15 @@ def print_timeframe_stats(timeframe_data):
         
         print(f"{tf:<10} | {bars:<10} | {days:<6} | {close:<12} | {start} to {end}")
 
+def print_dictionary_contents(data_dict):
+    """
+    Iterates through a dictionary and prints each key-value pair 
+    followed by a newline character.
+    """
+    for key, value in data_dict.items():
+        # The \n at the end ensures an extra space between entries
+        print(f"{key}: {value}")
+
 # load data from csv
 filename = 'XBTUSD_1.csv'
 symbol = 'BTC-USD'
@@ -64,4 +73,21 @@ print("\n[MAIN] Summarizing data from data_bundle....\n\n")
 summary = get_data_summary(data_bundle)
 print("\nData Summary:")
 print_timeframe_stats(summary)
+
+adf_result = perform_adf_test(symbol, '1h', 0.5, con)
+adf2_result = perform_adf_test(symbol, '1h', 1, con)
+print(f"\nADF results for {symbol} at the 1h timeframe, 6 months:")
+print_dictionary_contents(adf_result)
+print(f"\nADF results for {symbol} at the 1h timeframe, 12 months:")
+print_dictionary_contents(adf2_result)
+
+hurst_result = calculate_hurst_exponent(symbol, '4h', 0.5, con)
+hurst2_result = calculate_hurst_exponent(symbol, '4h', 1, con)
+print(f"\nHurst results for {symbol} at the 4h timeframe, 6 months:")
+print_dictionary_contents(hurst_result)
+print(f"\nHurst results for {symbol} at the 4h timeframe, 12 months:")
+print_dictionary_contents(hurst2_result)
+
+
 con.close()
+

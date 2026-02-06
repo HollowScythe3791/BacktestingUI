@@ -5,3 +5,5 @@ prompt.txt
 XBTUSD_1.csv
 XBTUSD_1_short.csv
 financial_data.duckdb
+test.py
+__pycache__
