@@ -7,3 +7,5 @@ XBTUSD_1_short.csv
 financial_data.duckdb
 test.py
 __pycache__
+__pycache__/
+data/

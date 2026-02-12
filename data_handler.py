@@ -68,13 +68,8 @@ def resample_ohlcv(symbol: str, timeframe: str, conn: duckdb.DuckDBPyConnection)
     """
     Resamples 1-minute data in the database to higher timeframes.
     """
-    exists_query = "SELECT COUNT(*) FROM market_data WHERE symbol = ? AND timeframe = ?"
-    count = conn.execute(exists_query, [symbol, timeframe]).fetchone()[0]
-    
-    if count > 0:
-        return
 
-    print(f"Resampling {symbol} 1m -> {timeframe}...")
+    # print(f"Resampling {symbol} 1m -> {timeframe}...")
     
     seconds_bucket = _parse_timeframe_to_seconds(timeframe)
     
@@ -96,9 +91,9 @@ def resample_ohlcv(symbol: str, timeframe: str, conn: duckdb.DuckDBPyConnection)
     """
     
     conn.execute(query, [symbol])
-    print(f"Resampling complete for {symbol} {timeframe}.")
+    # print(f"Resampling complete for {symbol} {timeframe}.")
 
-def load_data(symbol: str, timeframe: str, lookback_years: float, conn: duckdb.DuckDBPyConnection) -> pd.DataFrame:
+def load_data_years(symbol: str, timeframe: str, lookback_years: float, conn: duckdb.DuckDBPyConnection) -> pd.DataFrame:
     """
     Load OHLCV data from DuckDB relative to the LAST available data point.
     """
@@ -108,6 +103,7 @@ def load_data(symbol: str, timeframe: str, lookback_years: float, conn: duckdb.D
     max_ts = conn.execute(max_ts_query, [symbol, timeframe]).fetchone()[0]
 
     if max_ts is None:
+        print(f"Nothing found in database for {symbol}")
         return pd.DataFrame()
 
     seconds_per_year = 31_536_000
@@ -140,6 +136,60 @@ def load_data(symbol: str, timeframe: str, lookback_years: float, conn: duckdb.D
     
     return df
 
+def load_data_bars(symbol: str, timeframe: str, lookback_bars: int, conn: duckdb.DuckDBPyConnection) -> pd.DataFrame:
+    """
+    Load the LAST N bars of OHLCV data from DuckDB for a specific symbol and timeframe.
+    Returns data in chronological order (oldest -> newest).
+    """
+    # Ensure the timeframe data exists (assuming this function exists in your pipeline)
+    # resample_ohlcv(symbol, timeframe, conn) 
+    
+    # 1. Validation
+    if lookback_bars <= 0:
+        raise ValueError("lookback_bars must be > 0")
+
+    # 2. The Query
+    # We use a CTE ('recent_data') to get the latest N bars efficiently,
+    # then select from that CTE to order them chronologically for analysis.
+    query = """
+        WITH recent_data AS (
+            SELECT unixtime, open, high, low, close, volume, num_trades
+            FROM market_data
+            WHERE symbol = ? 
+              AND timeframe = ? 
+            ORDER BY unixtime DESC
+            LIMIT ?
+        )
+        SELECT * FROM recent_data ORDER BY unixtime ASC
+    """
+    
+    # 3. Execution (Arrow is faster for large datasets)
+    arrow_result = conn.execute(query, [symbol, timeframe, lookback_bars]).arrow()
+    
+    if isinstance(arrow_result, pa.lib.RecordBatchReader):
+        arrow_table = arrow_result.read_all()
+    else:
+        arrow_table = arrow_result
+
+    df = arrow_table.to_pandas()
+    
+    # 4. Empty Check
+    if df.empty:
+        print(f"No data found for {symbol} on {timeframe}")
+        return df
+
+    # 5. Formatting
+    df['datetime'] = pd.to_datetime(df['unixtime'], unit='s')
+    df.set_index('datetime', inplace=True)
+    df.drop(columns=['unixtime'], inplace=True)
+    
+    # Scientific Integrity Check:
+    # Ensure we actually got the number of bars requested (or warn if data is short)
+    if len(df) < lookback_bars:
+        print(f"Warning: Requested {lookback_bars} bars for {symbol}, but only found {len(df)}.")
+    
+    return df
+
 def prepare_data(symbol: str, conn: duckdb.DuckDBPyConnection, timeframes: Optional[List[str]] = None, lookback_years: float = 2) -> Dict[str, pd.DataFrame]:
     """
     Orchestrator to get a dictionary of dataframes for multiple timeframes.
@@ -150,7 +200,7 @@ def prepare_data(symbol: str, conn: duckdb.DuckDBPyConnection, timeframes: Optio
     data_store = {}
     
     for tf in timeframes:
-        df = load_data(symbol, tf, lookback_years, conn)
+        df = load_data_years(symbol, tf, lookback_years, conn)
         if not df.empty:
             data_store[tf] = df
         else:
